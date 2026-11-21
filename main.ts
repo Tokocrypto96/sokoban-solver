@@ -6,10 +6,13 @@
 // Method: a generated level is a one-square-wide hallway with rooms off it.
 // A box pushed out of its room can never come back, so each room is an
 // independent push-optimal subproblem and the level optimum is the sum of
-// the room optima. Each room is solved by a breadth-first search over
-// pushes (state = box cells + the player's reachable region), then the
-// pushes are expanded into full player moves and the rooms are chained by
-// walking the player along the hallway.
+// the room optima. Each room is solved push-optimally by an A* search
+// over pushes (state = box cells + the player's reachable region), guided
+// by a minimum-cost box-to-goal matching heuristic over precomputed push
+// distances, with static dead-square pruning. The pushes are then
+// expanded into full player moves and the rooms are chained by walking
+// the player along the hallway. Search budgets are counted in expansions,
+// never in wall-clock time, so runs are byte-for-byte deterministic.
 
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -178,15 +181,81 @@ function decompose(L) {
 
 // ------------------------------------------------------------ room solver
 
-// Solve one room push-optimally by breadth-first search over pushes.
-// The room grid is the room's cells plus its hallway entry cells; the
-// player starts on an entry cell. When needExit is set, the final player
-// region must contain an entry cell so the player can leave again.
-// Returns { pushes: [{from, dir}], finalPlayer } in global cell indices,
+// ------------------------------------------------------- room precompute
+
+// Push-distance table per goal over the room grid (other boxes ignored):
+// the minimum number of pushes that moves a box from a cell to that goal.
+// Computed by reverse BFS from the goal over push moves: a box arrived at
+// cell c pushed in direction d, so it came from p = c - d and the player
+// stood at s = p - d; both must be open cells.
+function pushDistances(W, H, localWall, goals) {
+  const N = W * H;
+  const tables = [];
+  for (const g of goals) {
+    const dist = new Int32Array(N).fill(-1);
+    dist[g] = 0;
+    const queue = [g];
+    let head = 0;
+    while (head < queue.length) {
+      const c = queue[head++];
+      const cx = c % W, cy = (c / W) | 0;
+      for (let d = 0; d < 4; d++) {
+        const px = cx - DX[d], py = cy - DY[d];
+        const sx = px - DX[d], sy = py - DY[d];
+        if (px < 0 || py < 0 || px >= W || py >= H) continue;
+        if (sx < 0 || sy < 0 || sx >= W || sy >= H) continue;
+        const p = py * W + px, s = sy * W + sx;
+        if (localWall[p] || localWall[s] || dist[p] !== -1) continue;
+        dist[p] = dist[c] + 1;
+        queue.push(p);
+      }
+    }
+    tables.push(dist);
+  }
+  return tables;
+}
+
+// Minimum-cost assignment of boxes to distinct goals by table distance.
+// Boxes and goals are few (at most 4), so try every permutation.
+// Returns -1 when some box cannot reach any goal.
+function matchCost(tables, boxes) {
+  const n = boxes.length;
+  if (n === 0) return 0;
+  const perm = boxes.map((_, i) => i);
+  let best = -1;
+  const visit = (k) => {
+    if (k === n) {
+      let sum = 0;
+      for (let i = 0; i < n; i++) {
+        const d = tables[perm[i]][boxes[i]];
+        if (d < 0) return;
+        sum += d;
+        if (best !== -1 && sum >= best) return;
+      }
+      best = sum;
+      return;
+    }
+    for (let i = k; i < n; i++) {
+      const t = perm[k]; perm[k] = perm[i]; perm[i] = t;
+      visit(k + 1);
+      const u = perm[k]; perm[k] = perm[i]; perm[i] = u;
+    }
+  };
+  visit(0);
+  return best;
+}
+
+// ------------------------------------------------------------ room solver
+
+// Solve one room push-optimally with A* over pushes, guided by the
+// matching heuristic over push distances, with static dead-square
+// pruning. The room grid is the room's cells plus its hallway entry
+// cells; the player starts on an entry cell. When needExit is set, the
+// final player region must contain an entry cell so the player can
+// leave again. Returns { pushes, finalPlayer } in global cell indices,
 // or null when unsolved within the expansion budget.
 function solveRoom(L, room, needExit, budget) {
-  const { W, H, wall, goal } = L;
-  void wall; void goal;
+  const { W, H } = L;
   const open = new Uint8Array(W * H);
   for (const c of room.cells) open[c] = 1;
   for (const e of room.entries) open[e] = 1;
@@ -194,8 +263,21 @@ function solveRoom(L, room, needExit, budget) {
   for (let i = 0; i < W * H; i++) localWall[i] = open[i] ? 0 : 1;
   const goalSet = new Set(room.goals);
   const entrySet = new Set(room.entries);
+  const goals = [...room.goals].sort((a, b) => a - b);
+  const tables = pushDistances(W, H, localWall, goals);
+  // Static dead cells: no goal is reachable from them in the push graph.
+  const dead = new Uint8Array(W * H);
+  for (let c = 0; c < W * H; c++) {
+    if (localWall[c] || goalSet.has(c)) continue;
+    let alive = false;
+    for (const t of tables) if (t[c] >= 0) { alive = true; break; }
+    if (!alive) dead[c] = 1;
+  }
 
   const startBoxes = [...room.boxes].sort((a, b) => a - b);
+  for (const b of startBoxes) if (dead[b]) return null;
+  const h0 = matchCost(tables, startBoxes);
+  if (h0 < 0) return null;
   const startRegion = flood(W, H, localWall, new Set(startBoxes), room.entries[0]);
   // The player may walk the hallway between this room's own entry cells.
   for (const e of room.entries) {
@@ -205,10 +287,46 @@ function solveRoom(L, room, needExit, budget) {
   const startRep = regionRep(startRegion);
 
   const keyOf = (boxes, rep) => boxes.join(',') + '|' + rep;
-  const nodes = [{ boxes: startBoxes, rep: startRep, parent: -1, from: -1, dir: -1 }];
-  const seen = new Map([[keyOf(startBoxes, startRep), 0]]);
-  let head = 0;
-  let expansions = 0;
+  const nodes = [{
+    boxes: startBoxes, rep: startRep, g: 0, h: h0, parent: -1, from: -1, dir: -1,
+  }];
+  const best = new Map([[keyOf(startBoxes, startRep), 0]]);
+  // Binary heap of node ids ordered by (f, h, id): deterministic.
+  const heap = [0];
+  const less = (a, b) => {
+    const fa = nodes[a].g + nodes[a].h, fb = nodes[b].g + nodes[b].h;
+    if (fa !== fb) return fa < fb;
+    if (nodes[a].h !== nodes[b].h) return nodes[a].h < nodes[b].h;
+    return a < b;
+  };
+  const heapPush = (id) => {
+    heap.push(id);
+    let i = heap.length - 1;
+    while (i > 0) {
+      const p = (i - 1) >> 1;
+      if (!less(heap[i], heap[p])) break;
+      const t = heap[i]; heap[i] = heap[p]; heap[p] = t;
+      i = p;
+    }
+  };
+  const heapPop = () => {
+    const top = heap[0];
+    const last = heap.pop();
+    if (heap.length) {
+      heap[0] = last;
+      let i = 0;
+      for (;;) {
+        const l = 2 * i + 1, r = l + 1;
+        let m = i;
+        if (l < heap.length && less(heap[l], heap[m])) m = l;
+        if (r < heap.length && less(heap[r], heap[m])) m = r;
+        if (m === i) break;
+        const t = heap[i]; heap[i] = heap[m]; heap[m] = t;
+        i = m;
+      }
+    }
+    return top;
+  };
   const isGoal = (boxes, rep) => {
     for (const b of boxes) if (!goalSet.has(b)) return false;
     if (!needExit) return true;
@@ -216,13 +334,21 @@ function solveRoom(L, room, needExit, budget) {
     for (const e of entrySet) if (region[e]) return true;
     return false;
   };
-  if (isGoal(startBoxes, startRep)) {
-    return { pushes: [], finalPlayer: room.entries[0] };
-  }
-  while (head < nodes.length) {
-    const node = nodes[head];
-    const nodeId = head;
-    head++;
+  let expansions = 0;
+  while (heap.length) {
+    const nodeId = heapPop();
+    const node = nodes[nodeId];
+    if (node.g !== best.get(keyOf(node.boxes, node.rep))) continue;
+    if (isGoal(node.boxes, node.rep)) {
+      const pushes = [];
+      let cur = node;
+      while (cur.parent !== -1) {
+        pushes.push({ from: cur.from, dir: cur.dir });
+        cur = nodes[cur.parent];
+      }
+      pushes.reverse();
+      return { pushes, finalPlayer: lastPlayerCell(L, room, pushes) };
+    }
     if (++expansions > budget) return null;
     const boxesAt = new Set(node.boxes);
     const region = flood(W, H, localWall, boxesAt, node.rep);
@@ -234,27 +360,25 @@ function solveRoom(L, room, needExit, budget) {
         const dest = (by + DY[d]) * W + (bx + DX[d]);
         if (stand < 0 || stand >= W * H || dest < 0 || dest >= W * H) continue;
         if (!region[stand]) continue;
-        if (localWall[dest] || boxesAt.has(dest)) continue;
+        if (localWall[dest] || boxesAt.has(dest) || dead[dest]) continue;
         const nextBoxes = [...node.boxes];
         nextBoxes[bi] = dest;
         nextBoxes.sort((a, b) => a - b);
+        const ng = node.g + 1;
         // After the push the player stands on the box's old cell.
         const nextRegion = flood(W, H, localWall, new Set(nextBoxes), b);
         const nextRep = regionRep(nextRegion);
         const key = keyOf(nextBoxes, nextRep);
-        if (seen.has(key)) continue;
-        seen.set(key, nodes.length);
-        nodes.push({ boxes: nextBoxes, rep: nextRep, parent: nodeId, from: b, dir: d });
-        if (isGoal(nextBoxes, nextRep)) {
-          const pushes = [];
-          let cur = nodes[nodes.length - 1];
-          while (cur.parent !== -1) {
-            pushes.push({ from: cur.from, dir: cur.dir });
-            cur = nodes[cur.parent];
-          }
-          pushes.reverse();
-          return { pushes, finalPlayer: lastPlayerCell(L, room, pushes) };
-        }
+        const prevBest = best.get(key);
+        if (prevBest !== undefined && prevBest <= ng) continue;
+        const nh = matchCost(tables, nextBoxes);
+        if (nh < 0) continue;
+        best.set(key, ng);
+        nodes.push({
+          boxes: nextBoxes, rep: nextRep, g: ng, h: nh,
+          parent: nodeId, from: b, dir: d,
+        });
+        heapPush(nodes.length - 1);
       }
     }
   }
