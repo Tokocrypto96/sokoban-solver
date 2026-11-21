@@ -179,7 +179,33 @@ function decompose(L) {
   return rooms;
 }
 
-// ------------------------------------------------------------ room solver
+// Freeze deadlock: a 2x2 block of only walls and boxes can never change
+// again; if any box in it is not on a goal, the position is dead. Only
+// blocks containing the just-moved box can newly freeze, so only those
+// are tested.
+function inFreeze(W, H, localWall, boxesAt, goalSet, cell) {
+  const cx = cell % W, cy = (cell / W) | 0;
+  for (let oy = -1; oy <= 0; oy++) {
+    for (let ox = -1; ox <= 0; ox++) {
+      let allSolid = true, badBox = false;
+      for (let dy = 0; dy < 2 && allSolid; dy++) {
+        for (let dx = 0; dx < 2; dx++) {
+          const x = cx + ox + dx, y = cy + oy + dy;
+          if (x < 0 || y < 0 || x >= W || y >= H) continue; // off-board: solid
+          const c = y * W + x;
+          if (localWall[c]) continue;
+          if (boxesAt.has(c)) {
+            if (!goalSet.has(c)) badBox = true;
+            continue;
+          }
+          allSolid = false;
+        }
+      }
+      if (allSolid && badBox) return true;
+    }
+  }
+  return false;
+}
 
 // ------------------------------------------------------- room precompute
 
@@ -248,13 +274,17 @@ function matchCost(tables, boxes) {
 // ------------------------------------------------------------ room solver
 
 // Solve one room push-optimally with A* over pushes, guided by the
-// matching heuristic over push distances, with static dead-square
-// pruning. The room grid is the room's cells plus its hallway entry
-// cells; the player starts on an entry cell. When needExit is set, the
-// final player region must contain an entry cell so the player can
-// leave again. Returns { pushes, finalPlayer } in global cell indices,
-// or null when unsolved within the expansion budget.
-function solveRoom(L, room, needExit, budget) {
+// matching heuristic over push distances, with static dead-square and
+// freeze pruning. With weight > 1 the heuristic is over-weighted: the
+// search then usually finishes far sooner but may return a suboptimal
+// solution — used only as a fallback when the exact search runs out of
+// budget, since a suboptimal solve still scores while a timeout does
+// not. The room grid is the room's cells plus its hallway entry cells;
+// the player starts on an entry cell. When needExit is set, the final
+// player region must contain an entry cell so the player can leave
+// again. Returns { pushes, finalPlayer } in global cell indices, or
+// null when unsolved within the expansion budget.
+function solveRoom(L, room, needExit, budget, weight) {
   const { W, H } = L;
   const open = new Uint8Array(W * H);
   for (const c of room.cells) open[c] = 1;
@@ -294,7 +324,7 @@ function solveRoom(L, room, needExit, budget) {
   // Binary heap of node ids ordered by (f, h, id): deterministic.
   const heap = [0];
   const less = (a, b) => {
-    const fa = nodes[a].g + nodes[a].h, fb = nodes[b].g + nodes[b].h;
+    const fa = nodes[a].g + weight * nodes[a].h, fb = nodes[b].g + weight * nodes[b].h;
     if (fa !== fb) return fa < fb;
     if (nodes[a].h !== nodes[b].h) return nodes[a].h < nodes[b].h;
     return a < b;
@@ -364,9 +394,11 @@ function solveRoom(L, room, needExit, budget) {
         const nextBoxes = [...node.boxes];
         nextBoxes[bi] = dest;
         nextBoxes.sort((a, b) => a - b);
+        const nextBoxesAt = new Set(nextBoxes);
+        if (inFreeze(W, H, localWall, nextBoxesAt, goalSet, dest)) continue;
         const ng = node.g + 1;
         // After the push the player stands on the box's old cell.
-        const nextRegion = flood(W, H, localWall, new Set(nextBoxes), b);
+        const nextRegion = flood(W, H, localWall, nextBoxesAt, b);
         const nextRep = regionRep(nextRegion);
         const key = keyOf(nextBoxes, nextRep);
         const prevBest = best.get(key);
@@ -433,10 +465,15 @@ function solveLevel(text) {
       entries: [L.player],
     }];
   }
-  const BUDGET = 2000000;
+  const BUDGET = 1500000;
+  const solveWithFallback = (room, needExit) => {
+    const exact = solveRoom(L, room, needExit, BUDGET, 1);
+    if (exact) return exact;
+    return solveRoom(L, room, needExit, BUDGET, 3);
+  };
   const solved = rooms.map((room) => ({
     room,
-    res: solveRoom(L, room, false, BUDGET),
+    res: solveWithFallback(room, false),
   }));
   for (const s of solved) if (!s.res) return '';
   // Decide play order: a room whose final player region cannot reach its
@@ -453,7 +490,7 @@ function solveLevel(text) {
   if (stuckIdx.length > 1) {
     for (let k = 1; k < stuckIdx.length; k++) {
       const s = solved[stuckIdx[k]];
-      const res = solveRoom(L, s.room, true, BUDGET);
+      const res = solveWithFallback(s.room, true);
       if (res) s.res = res;
     }
   }
